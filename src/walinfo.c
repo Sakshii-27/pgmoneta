@@ -28,6 +28,7 @@
 
 /* pgmoneta */
 #include <achv.h>
+#include <art.h>
 #include <cmd.h>
 #include <configuration.h>
 #include <deque.h>
@@ -263,6 +264,8 @@ struct ui_state
    size_t current_match_index;
    size_t total_matches_in_field;
    enum wal_search_field current_search_field;
+
+   struct art* lsn_art;
    char current_search_query[256];
 };
 
@@ -283,9 +286,10 @@ static int wal_interactive_load_file(struct ui_state* state, const char* path);
 static int wal_interactive_load_records(struct ui_state* state, char* wal_filename);
 static void wal_set_window_theme(WINDOW* win, int color_pair, bool border);
 static void wal_reset_completion_cycle(bool* active, int* cycle_index, char cycle_seed[][128], int fields);
-static bool wal_input_has_letter(const char* input);
-static const char* const* wal_get_known_values_for_field(int field);
+static bool wal_input_has_content(const char* input);
+static const char* const* wal_get_known_values_for_field(struct ui_state* state, int field, const char* partial, char*** dynamic_array_out, char** field_inputs);
 static const char* wal_get_known_value_completion(const char* const* values, const char* partial, int cycle_index);
+static void wal_handle_tab_completion(struct ui_state* state, int current_field, char** field_inputs, size_t* field_input_sizes, bool* completion_active, int* completion_cycle, char completion_seed[][128]);
 
 static void
 wal_interactive_endwin(void)
@@ -376,7 +380,7 @@ wal_reset_completion_cycle(bool* active, int* cycle_index, char cycle_seed[][128
 }
 
 static bool
-wal_input_has_letter(const char* input)
+wal_input_has_content(const char* input)
 {
    if (input == NULL)
    {
@@ -385,7 +389,7 @@ wal_input_has_letter(const char* input)
 
    for (size_t i = 0; input[i] != '\0'; i++)
    {
-      if (isalpha((unsigned char)input[i]))
+      if (!isspace((unsigned char)input[i]))
       {
          return true;
       }
@@ -395,15 +399,151 @@ wal_input_has_letter(const char* input)
 }
 
 static const char* const*
-wal_get_known_values_for_field(int field)
+wal_get_known_values_for_field(struct ui_state* state, int field, const char* partial, char*** dynamic_array_out, char** field_inputs)
 {
+   if (dynamic_array_out)
+   {
+      *dynamic_array_out = NULL;
+   }
+
    switch (field)
    {
       case 0:
          return wal_search_rmgr_values;
+      case 1:
+      case 2:
+      {
+         if (state != NULL && state->lsn_art != NULL && dynamic_array_out != NULL)
+         {
+            char upper_prefix[256] = {0};
+            if (partial != NULL && strlen(partial) > 0)
+            {
+               for (size_t j = 0; j < strlen(partial) && j < 255; j++)
+               {
+                  upper_prefix[j] = toupper((unsigned char)partial[j]);
+               }
+            }
+            pgmoneta_art_prefix_search(state->lsn_art, upper_prefix, dynamic_array_out, 64);
+
+            // Apply bound filtering for End LSN (field 2)
+            if (field == 2 && field_inputs != NULL && wal_input_has_content(field_inputs[1]))
+            {
+               uint64_t start_lsn_val = pgmoneta_string_to_lsn(field_inputs[1]);
+               if (start_lsn_val != 0 && *dynamic_array_out != NULL)
+               {
+                  char** results = *dynamic_array_out;
+                  int valid_count = 0;
+
+                  for (int i = 0; results[i] != NULL; i++)
+                  {
+                     uint64_t cand_lsn = pgmoneta_string_to_lsn(results[i]);
+                     if (cand_lsn > start_lsn_val)
+                     {
+                        if (valid_count != i)
+                        {
+                           results[valid_count] = results[i];
+                        }
+                        valid_count++;
+                     }
+                     else
+                     {
+                        free(results[i]);
+                     }
+                  }
+                  results[valid_count] = NULL;
+               }
+            }
+
+            // Apply reciprocal bound filtering for Start LSN (field 1)
+            if (field == 1 && field_inputs != NULL && wal_input_has_content(field_inputs[2]))
+            {
+               uint64_t end_lsn_val = pgmoneta_string_to_lsn(field_inputs[2]);
+               if (end_lsn_val != 0 && *dynamic_array_out != NULL)
+               {
+                  char** results = *dynamic_array_out;
+                  int valid_count = 0;
+
+                  for (int i = 0; results[i] != NULL; i++)
+                  {
+                     uint64_t cand_lsn = pgmoneta_string_to_lsn(results[i]);
+                     if (cand_lsn < end_lsn_val)
+                     {
+                        if (valid_count != i)
+                        {
+                           results[valid_count] = results[i];
+                        }
+                        valid_count++;
+                     }
+                     else
+                     {
+                        free(results[i]);
+                     }
+                  }
+                  results[valid_count] = NULL;
+               }
+            }
+
+            return (const char* const*)*dynamic_array_out;
+         }
+         return NULL;
+      }
       default:
          return NULL;
    }
+}
+static char*
+wal_get_longest_common_prefix(const char* const* values, const char* partial)
+{
+   if (values == NULL || values[0] == NULL)
+   {
+      return NULL;
+   }
+
+   char* lcp = NULL;
+   size_t partial_len = partial ? strlen(partial) : 0;
+   int first_match_idx = -1;
+
+   for (int i = 0; values[i] != NULL; i++)
+   {
+      if (partial_len == 0 || strncasecmp(values[i], partial, partial_len) == 0)
+      {
+         first_match_idx = i;
+         break;
+      }
+   }
+
+   if (first_match_idx == -1)
+   {
+      return NULL;
+   }
+
+   lcp = malloc(strlen(values[first_match_idx]) + 1);
+   if (lcp == NULL)
+   {
+      return NULL;
+   }
+   strcpy(lcp, values[first_match_idx]);
+
+   for (int i = first_match_idx + 1; values[i] != NULL; i++)
+   {
+      if (partial_len == 0 || strncasecmp(values[i], partial, partial_len) == 0)
+      {
+         size_t j = 0;
+         while (lcp[j] != '\0' && values[i][j] != '\0' &&
+                tolower((unsigned char)lcp[j]) == tolower((unsigned char)values[i][j]))
+         {
+            j++;
+         }
+         lcp[j] = '\0';
+
+         if (strlen(lcp) == 0)
+         {
+            break;
+         }
+      }
+   }
+
+   return lcp;
 }
 
 static const char*
@@ -436,6 +576,81 @@ wal_get_known_value_completion(const char* const* values, const char* partial, i
    }
 
    return NULL;
+}
+
+static void
+wal_handle_tab_completion(struct ui_state* state, int current_field, char** field_inputs, size_t* field_input_sizes, bool* completion_active, int* completion_cycle, char completion_seed[][128])
+{
+   char* current_input = field_inputs[current_field];
+   char* search_partial = completion_active[current_field] ? completion_seed[current_field] : current_input;
+   char** dynamic_values = NULL;
+   const char* const* known_values = wal_get_known_values_for_field(state, current_field, search_partial, &dynamic_values, field_inputs);
+   size_t input_size = field_input_sizes[current_field];
+   const char* completion = NULL;
+
+   if (known_values == NULL || current_input == NULL)
+   {
+      if (dynamic_values != NULL)
+      {
+         for (int i = 0; dynamic_values[i]; i++)
+         {
+            free(dynamic_values[i]);
+         }
+         free(dynamic_values);
+      }
+      return;
+   }
+
+   if (!completion_active[current_field])
+   {
+      char* lcp = wal_get_longest_common_prefix(known_values, current_input);
+      if (lcp != NULL)
+      {
+         size_t lcp_len = strlen(lcp);
+         if (lcp_len > strlen(current_input))
+         {
+            pgmoneta_snprintf(current_input, input_size, "%s", lcp);
+            free(lcp);
+
+            if (dynamic_values != NULL)
+            {
+               for (int i = 0; dynamic_values[i]; i++)
+               {
+                  free(dynamic_values[i]);
+               }
+               free(dynamic_values);
+            }
+            return;
+         }
+         free(lcp);
+      }
+
+      completion_active[current_field] = true;
+      completion_cycle[current_field] = 0;
+      pgmoneta_snprintf(completion_seed[current_field], 128, "%s", current_input);
+   }
+
+   completion = wal_get_known_value_completion(known_values, completion_seed[current_field], completion_cycle[current_field]);
+   if (completion == NULL)
+   {
+      completion_cycle[current_field] = 0;
+      completion = wal_get_known_value_completion(known_values, completion_seed[current_field], completion_cycle[current_field]);
+   }
+
+   if (completion != NULL)
+   {
+      pgmoneta_snprintf(current_input, input_size, "%s", completion);
+      completion_cycle[current_field]++;
+   }
+
+   if (dynamic_values != NULL)
+   {
+      for (int i = 0; dynamic_values[i] != NULL; i++)
+      {
+         free(dynamic_values[i]);
+      }
+      free(dynamic_values);
+   }
 }
 
 /**
@@ -957,6 +1172,29 @@ wal_interactive_load_records(struct ui_state* state, char* wal_filename)
 
    state->record_count_unfiltered = state->record_count;
 
+   if (state->lsn_art != NULL)
+   {
+      pgmoneta_art_destroy(state->lsn_art);
+      state->lsn_art = NULL;
+   }
+   pgmoneta_art_create(&state->lsn_art);
+
+   for (size_t i = 0; i < state->record_count; i++)
+   {
+      char* sl = pgmoneta_lsn_to_string(state->records[i].start_lsn);
+      char* el = pgmoneta_lsn_to_string(state->records[i].end_lsn);
+      if (sl != NULL)
+      {
+         pgmoneta_art_insert(state->lsn_art, sl, 0, ValueInt32);
+         free(sl);
+      }
+      if (el != NULL)
+      {
+         pgmoneta_art_insert(state->lsn_art, el, 0, ValueInt32);
+         free(el);
+      }
+   }
+
    return 0;
 }
 
@@ -1259,6 +1497,29 @@ wal_apply_filters(struct ui_state* state)
    }
 
    state->record_count = new_count;
+
+   if (state->lsn_art != NULL)
+   {
+      pgmoneta_art_destroy(state->lsn_art);
+      state->lsn_art = NULL;
+   }
+   pgmoneta_art_create(&state->lsn_art);
+
+   for (size_t i = 0; i < state->record_count; i++)
+   {
+      char* sl = pgmoneta_lsn_to_string(state->records[i].start_lsn);
+      char* el = pgmoneta_lsn_to_string(state->records[i].end_lsn);
+      if (sl != NULL)
+      {
+         pgmoneta_art_insert(state->lsn_art, sl, 0, ValueInt32);
+         free(sl);
+      }
+      if (el != NULL)
+      {
+         pgmoneta_art_insert(state->lsn_art, el, 0, ValueInt32);
+         free(el);
+      }
+   }
 }
 
 /**
@@ -1652,7 +1913,7 @@ wal_search(struct ui_state* state, struct wal_search_criteria* criteria)
          /* Check End LSN (as range maximum) */
          if (matches_all && criteria->has_end_lsn)
          {
-            if (record->lsn > criteria->end_lsn)
+            if (record->next_lsn > criteria->end_lsn)
             {
                matches_all = false;
             }
@@ -2831,6 +3092,7 @@ show_help(void)
 
 /**
  * Show known values for a field and highlight the current completion.
+ * Values are never truncated: only entries that fit fully are displayed.
  */
 static void
 show_known_values_autocomplete(WINDOW* win, const char* const* values, const char* partial, const char* selected, int y, int x, int max_rows)
@@ -2859,9 +3121,9 @@ show_known_values_autocomplete(WINDOW* win, const char* const* values, const cha
    for (int i = 0; values[i] != NULL; i++)
    {
       bool matches = true;
-      int entry_width = (int)strlen(values[i]) + 4;
+      int entry_width = (int)strlen(values[i]) + 4; /* "  " prefix + value + padding */
 
-      if (wal_input_has_letter(partial))
+      if (wal_input_has_content(partial))
       {
          matches = strncasecmp(values[i], partial, strlen(partial)) == 0;
       }
@@ -2873,6 +3135,11 @@ show_known_values_autocomplete(WINDOW* win, const char* const* values, const cha
 
       filtered_values[value_count] = values[i];
       value_count++;
+
+      if (value_count >= 64)
+      {
+         break;
+      }
 
       if (entry_width > column_width)
       {
@@ -2890,51 +3157,82 @@ show_known_values_autocomplete(WINDOW* win, const char* const* values, const cha
       column_width = 4;
    }
 
-   columns = available_width / column_width;
-   if (columns <= 0)
+   int max_cols = available_width / column_width;
+   if (max_cols <= 0)
    {
-      columns = 1;
+      max_cols = 1;
+   }
+
+   columns = (value_count + max_rows - 1) / max_rows;
+   if (columns > max_cols)
+   {
+      columns = max_cols;
    }
 
    rows_per_column = (value_count + columns - 1) / columns;
-   while (columns > 1 && rows_per_column > max_rows)
-   {
-      columns--;
-      rows_per_column = (value_count + columns - 1) / columns;
-   }
-
    if (rows_per_column > max_rows)
    {
       rows_per_column = max_rows;
    }
 
+   /* Clear the suggestion area */
    for (int row = 1; row <= max_rows; row++)
    {
       mvwprintw(win, y + row, x, "%-*s", available_width, "");
    }
 
-   for (int i = 0; i < value_count; i++)
+   /* Total items we can actually display = rows_per_column * columns */
+   int display_count = rows_per_column * columns;
+   if (display_count > value_count)
+   {
+      display_count = value_count;
+   }
+
+   for (int i = 0; i < display_count; i++)
    {
       int row = i % rows_per_column;
       int column = i / rows_per_column;
       int draw_x = x + (column * column_width);
       const char* value = filtered_values[i];
+      int remaining_width = max_x - draw_x - 1;
 
-      if (draw_x >= x + available_width)
+      if (column >= columns)
       {
          break;
+      }
+
+      /* Skip if the full value does not fit — never truncate */
+      int needed = (int)strlen(value) + 2; /* "  " or "> " prefix */
+      if (needed > remaining_width)
+      {
+         continue;
+      }
+
+      int pad_width = column_width - 4;
+      if (pad_width < (int)strlen(value))
+      {
+         pad_width = (int)strlen(value);
+      }
+      /* Clamp pad_width so we never write past the window edge */
+      if (pad_width > remaining_width - 2)
+      {
+         pad_width = remaining_width - 2;
+      }
+      if (pad_width < 1)
+      {
+         pad_width = 1;
       }
 
       if (selected != NULL && strcasecmp(value, selected) == 0)
       {
          wattron(win, COLOR_PAIR(3) | A_BOLD);
-         mvwprintw(win, y + row + 1, draw_x, "> %s", value);
+         mvwprintw(win, y + row + 1, draw_x, "> %-*s", pad_width, value);
          wattroff(win, COLOR_PAIR(3) | A_BOLD);
       }
       else
       {
          wattron(win, COLOR_PAIR(6) | A_DIM);
-         mvwprintw(win, y + row + 1, draw_x, "  %s", value);
+         mvwprintw(win, y + row + 1, draw_x, "  %-*s", pad_width, value);
          wattroff(win, COLOR_PAIR(6) | A_DIM);
       }
    }
@@ -2948,8 +3246,30 @@ handle_search_input(struct ui_state* state)
    int starty = (LINES - height) / 2;
    int startx = (COLS - width) / 2;
 
+   if (starty < 0)
+   {
+      starty = 0;
+   }
+   if (startx < 0)
+   {
+      startx = 0;
+   }
+   if (height > LINES)
+   {
+      height = LINES;
+   }
+   if (width > COLS)
+   {
+      width = COLS;
+   }
+
    WINDOW* search_win = newwin(height, width, starty, startx);
+   if (search_win == NULL)
+   {
+      return;
+   }
    wal_set_window_theme(search_win, 1, true);
+   keypad(search_win, TRUE);
 
    wattron(search_win, A_BOLD);
    mvwprintw(search_win, 1, 2, "Search WAL Records");
@@ -3052,28 +3372,39 @@ handle_search_input(struct ui_state* state)
       /* Clear autocomplete area first */
       for (int i = 0; i < height - autocomplete_row - 3; i++)
       {
-         mvwprintw(search_win, autocomplete_row + i, 2, "%-76s", "");
+         mvwprintw(search_win, autocomplete_row + i, 2, "%-*s", width - 3, "");
       }
 
       {
-         const char* const* known_values = wal_get_known_values_for_field(current_field);
+         char* suggestion_prefix = completion_active[current_field] ? completion_seed[current_field] : field_inputs[current_field];
+         char** dynamic_values = NULL;
+         const char* const* known_values = wal_get_known_values_for_field(state, current_field, suggestion_prefix, &dynamic_values, field_inputs);
 
          if (known_values != NULL)
          {
             mvwprintw(search_win, autocomplete_row, 2, "Suggestions:");
             show_known_values_autocomplete(search_win,
                                            known_values,
-                                           field_inputs[current_field],
+                                           suggestion_prefix,
                                            field_inputs[current_field],
                                            autocomplete_row,
                                            4,
                                            height - autocomplete_row - 4);
          }
+
+         if (dynamic_values != NULL)
+         {
+            for (int i = 0; dynamic_values[i] != NULL; i++)
+            {
+               free(dynamic_values[i]);
+            }
+            free(dynamic_values);
+         }
       }
 
       wrefresh(search_win);
 
-      int ch = getch();
+      int ch = wgetch(search_win);
 
       if (ch == 27)
       {
@@ -3092,40 +3423,7 @@ handle_search_input(struct ui_state* state)
       }
       else if (ch == '\t')
       {
-         const char* const* known_values = wal_get_known_values_for_field(current_field);
-         char* current_input = field_inputs[current_field];
-         size_t input_size = field_input_sizes[current_field];
-         const char* completion = NULL;
-
-         if (known_values == NULL || current_input == NULL)
-         {
-            continue;
-         }
-
-         if (!completion_active[current_field] && !wal_input_has_letter(current_input))
-         {
-            continue;
-         }
-
-         if (!completion_active[current_field])
-         {
-            completion_active[current_field] = true;
-            completion_cycle[current_field] = 0;
-            pgmoneta_snprintf(completion_seed[current_field], sizeof(completion_seed[current_field]), "%s", current_input);
-         }
-
-         completion = wal_get_known_value_completion(known_values, completion_seed[current_field], completion_cycle[current_field]);
-         if (completion == NULL)
-         {
-            completion_cycle[current_field] = 0;
-            completion = wal_get_known_value_completion(known_values, completion_seed[current_field], completion_cycle[current_field]);
-         }
-
-         if (completion != NULL)
-         {
-            pgmoneta_snprintf(current_input, input_size, "%s", completion);
-            completion_cycle[current_field]++;
-         }
+         wal_handle_tab_completion(state, current_field, field_inputs, field_input_sizes, completion_active, completion_cycle, completion_seed);
       }
       else if (ch == '\n')
       {
@@ -3250,7 +3548,28 @@ handle_filter_input(struct ui_state* state)
    int starty = (LINES - height) / 2;
    int startx = (COLS - width) / 2;
 
+   if (starty < 0)
+   {
+      starty = 0;
+   }
+   if (startx < 0)
+   {
+      startx = 0;
+   }
+   if (height > LINES)
+   {
+      height = LINES;
+   }
+   if (width > COLS)
+   {
+      width = COLS;
+   }
+
    WINDOW* search_win = newwin(height, width, starty, startx);
+   if (search_win == NULL)
+   {
+      return;
+   }
    wal_set_window_theme(search_win, 1, true);
    keypad(search_win, TRUE);
 
@@ -3397,22 +3716,31 @@ handle_filter_input(struct ui_state* state)
 
       for (int i = 0; i < max_suggest_rows; i++)
       {
-         mvwprintw(search_win, autocomplete_row + i, 2, "%-76s", "");
+         mvwprintw(search_win, autocomplete_row + i, 2, "%-*s", width - 3, "");
       }
 
       {
-         const char* const* known_values = wal_get_known_values_for_field(current_field);
+         char* suggestion_prefix = completion_active[current_field] ? completion_seed[current_field] : field_inputs[current_field];
+         char** dynamic_values = NULL;
+         const char* const* known_values = wal_get_known_values_for_field(state, current_field, suggestion_prefix, &dynamic_values, field_inputs);
 
          if (known_values != NULL && max_suggest_rows > 2)
          {
             mvwprintw(search_win, autocomplete_row, 2, "Suggestions:");
             show_known_values_autocomplete(search_win,
                                            known_values,
-                                           field_inputs[current_field],
+                                           suggestion_prefix,
                                            field_inputs[current_field],
                                            autocomplete_row,
                                            4,
                                            max_suggest_rows - 1);
+         }
+
+         if (dynamic_values != NULL)
+         {
+            for (int i = 0; dynamic_values[i]; i++)
+               free(dynamic_values[i]);
+            free(dynamic_values);
          }
       }
 
@@ -3446,40 +3774,7 @@ handle_filter_input(struct ui_state* state)
       }
       else if (ch == '\t')
       {
-         const char* const* known_values = wal_get_known_values_for_field(current_field);
-         char* current_input = field_inputs[current_field];
-         size_t input_size = field_input_sizes[current_field];
-         const char* completion = NULL;
-
-         if (known_values == NULL || current_input == NULL)
-         {
-            continue;
-         }
-
-         if (!completion_active[current_field] && !wal_input_has_letter(current_input))
-         {
-            continue;
-         }
-
-         if (!completion_active[current_field])
-         {
-            completion_active[current_field] = true;
-            completion_cycle[current_field] = 0;
-            pgmoneta_snprintf(completion_seed[current_field], sizeof(completion_seed[current_field]), "%s", current_input);
-         }
-
-         completion = wal_get_known_value_completion(known_values, completion_seed[current_field], completion_cycle[current_field]);
-         if (completion == NULL)
-         {
-            completion_cycle[current_field] = 0;
-            completion = wal_get_known_value_completion(known_values, completion_seed[current_field], completion_cycle[current_field]);
-         }
-
-         if (completion != NULL)
-         {
-            pgmoneta_snprintf(current_input, input_size, "%s", completion);
-            completion_cycle[current_field]++;
-         }
+         wal_handle_tab_completion(state, current_field, field_inputs, field_input_sizes, completion_active, completion_cycle, completion_seed);
       }
       else if (ch == '\n')
       {
@@ -4387,6 +4682,12 @@ wal_interactive_cleanup(struct ui_state* state)
    {
       free(state->wal_filename);
       state->wal_filename = NULL;
+   }
+
+   if (state->lsn_art)
+   {
+      pgmoneta_art_destroy(state->lsn_art);
+      state->lsn_art = NULL;
    }
 
    if (state->main_win)
